@@ -1,0 +1,111 @@
+pasue resume
+#define pausePin 5   // Define the Pause button pin
+#define resumePin 6  // Define the Resume button pin
+
+pinMode(pausePin, INPUT);
+pinMode(resumePin, INPUT);
+
+
+bool isPaused = false;  // Flag to check if paused
+
+
+void handleJogMenu() {
+  if (digitalRead(upPin) == HIGH) {
+    if (!isPaused && selectedOption > 0) {
+      selectedOption--;
+      updateJogMenu();
+    }
+    while (digitalRead(upPin) == HIGH) {}
+  }
+  
+  if (digitalRead(downPin) == HIGH) {
+    if (!isPaused && selectedOption < 4) {
+      selectedOption++;
+      updateJogMenu();
+    }
+    while (digitalRead(downPin) == HIGH) {}
+  }
+
+  if (digitalRead(selectPin) == HIGH) {
+    while (digitalRead(selectPin) == HIGH) {}
+    switch (selectedOption) {
+      case 0: jog("X", JOG_STEP_MM); break;
+      case 1: jog("X", -JOG_STEP_MM); break;
+      case 2: jog("Y", JOG_STEP_MM); break;
+      case 3: jog("Y", -JOG_STEP_MM); break;
+      case 4: showMainMenu(); return;
+    }
+    delay(500);
+    updateJogMenu();
+  }
+
+  // Pause functionality
+  if (digitalRead(pausePin) == HIGH) {
+    isPaused = true;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Paused...");
+    while (digitalRead(pausePin) == HIGH) {}  // Wait for button release
+  }
+
+  // Resume functionality
+  if (digitalRead(resumePin) == HIGH) {
+    isPaused = false;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Resuming...");
+    delay(500);  // Wait a bit before resuming
+    updateJogMenu();
+    while (digitalRead(resumePin) == HIGH) {}  // Wait for button release
+  }
+}
+
+
+
+void sendFile(String filename) {
+  File dataFile = SD.open(filename);
+  if (!dataFile) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("File Error!");
+    delay(2000);
+    return;
+  }
+
+  fileRunning = true;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Running:");
+  lcd.setCursor(0, 1);
+  lcd.print(filename.substring(0, 16));
+
+  // Send G-code setup
+  sendCodeLine("G90"); // Absolute coordinates
+  sendCodeLine("G21"); // Millimeters
+
+  // Read and send the file
+  while (dataFile.available() && fileRunning) {
+    if (isPaused) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Paused...");
+      while (isPaused) { delay(100); }  // Wait until Resume is pressed
+    }
+
+    String line = dataFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0 && !line.startsWith(";") && !line.startsWith("(")) {
+      sendCodeLine(line);
+    }
+    checkForOK();
+  }
+
+  if (fileRunning) {
+    lcd.setCursor(0, 1);
+    lcd.print("Completed");
+    delay(3000);
+  }
+  dataFile.close();
+  fileRunning = false;
+  showMainMenu();
+}

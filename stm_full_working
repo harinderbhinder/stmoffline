@@ -1,0 +1,602 @@
+// Hardware
+//   STM32F103C8T6
+//   - Serial1 (pins RX PA9 and TX PA10) communicates with arduino with grbl shield
+
+//   SD card attached to SPI bus as follows:
+//   CS - pin PA4
+//   MOSI - pin PA7
+//   MISO - pin PA6
+//   CLK - pin PA5
+
+//   Rotary Enconder attached af follows:
+//   CLK - pin PB14
+//   DT - pin PB13
+//   SW - pin PB15
+
+//   LCD Display
+//   the LCD display is connected to pins 20 (SDA) and 21 (SCL) (default i2c connections)
+
+//   SDA   : LCD Display PB7
+//   SCL   : LCD Display PB6
+
+
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define upPin       PA0
+#define downPin     PA1
+#define selectPin   PA2
+#define SD_card_Reader PA4  // SPI CS pin
+
+#define JOG_STEP_MM 10
+#define DEBOUNCE_DELAY 50 
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+bool awaitingOK = false;
+unsigned int numLineTotal = 0, numLineAct = 0;
+byte currentMenu = 0; // 0=main, 1=files, 2=jog
+byte selectedOption = 0;
+bool fileRunning = false;
+bool filePaused = false;  // New variable for pause state
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+  lcd.begin(16, 2);
+
+  pinMode(upPin, INPUT);
+  pinMode(downPin, INPUT);
+  pinMode(selectPin, INPUT);
+
+  Serial.begin(115200);
+
+  if (!SD.begin(SD_card_Reader)) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("Card Error!"));
+    while(1);
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F(" Harinder"));
+  delay(2000);
+
+  sendCodeLine("$10=0");
+  showMainMenu();
+}
+
+void showMainMenu() {
+  currentMenu = 0;
+  selectedOption = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F(">Unlock "));
+  lcd.setCursor(0, 1); lcd.print(F(" ZeroXY"));
+}
+
+void updateMainMenu() {
+  lcd.clear();
+  if (selectedOption == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(">Unlock "));
+    lcd.setCursor(0, 1); lcd.print(F(" ZeroXY"));
+  } else if (selectedOption == 1) {
+    lcd.setCursor(0, 0); lcd.print(F(" Unlock "));
+    lcd.setCursor(0, 1); lcd.print(F(">ZeroXY"));
+  } else if (selectedOption == 2) {
+    lcd.setCursor(0, 0); lcd.print(F(" ZeroXY"));
+    lcd.setCursor(0, 1); lcd.print(F(">ZeroZ"));
+  } else if (selectedOption == 3) {
+    lcd.setCursor(0, 0); lcd.print(F(" ZeroZ"));
+    lcd.setCursor(0, 1); lcd.print(F(">Run Files"));
+  } else if (selectedOption == 4) {
+    lcd.setCursor(0, 0); lcd.print(F(" Run Files"));
+    lcd.setCursor(0, 1); lcd.print(F(">Jog"));
+  }
+}
+
+void showFileMenu() {
+  currentMenu = 1;
+  selectedOption = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F(">Back"));
+  String filename = getFileName(1);
+  if (filename != "") {
+    lcd.setCursor(0, 1); lcd.print(F(" "));
+    lcd.print(filename.substring(0, 14));
+  } else {
+    lcd.setCursor(0, 1); lcd.print(F(" No files"));
+  }
+}
+
+void updateFileMenu() {
+  lcd.clear();
+  byte totalFiles = getFileCount();
+
+  if (totalFiles == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(">Back"));
+    lcd.setCursor(0, 1); lcd.print(F(" No files"));
+    return;
+  }
+
+  // Case 1: "Back" is selected (selectedOption = 0)
+  if (selectedOption == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(">Back"));
+    String firstFile = getFileName(1);
+    if (firstFile != "") {
+      lcd.setCursor(0, 1); lcd.print(F(" ")); // Space instead of '>'
+      lcd.print(firstFile.substring(0, 14));
+    }
+  }
+  // Case 2: A file is selected (selectedOption >= 1)
+  else {
+    String currentFile = getFileName(selectedOption);
+    String nextFile = (selectedOption < totalFiles) ? getFileName(selectedOption + 1) : "";
+
+    // Show current file with '>' if it exists
+    if (currentFile != "") {
+      lcd.setCursor(0, 0); 
+      lcd.print(F(">")); // Highlight current file
+      lcd.print(currentFile.substring(0, 14));
+    }
+
+    // Show next file (if available)
+    if (nextFile != "") {
+      lcd.setCursor(0, 1); 
+      lcd.print(F(" ")); // No highlight
+      lcd.print(nextFile.substring(0, 14));
+    }
+  }
+}
+
+String getFileName(byte index) {
+  byte count = 0;
+  File root = SD.open("/");
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) {
+      root.close();
+      return "";
+    }
+    if (!entry.isDirectory()) {
+      count++;
+      if (count == index) {
+        String result = entry.name();
+        entry.close(); root.close();
+        return result;
+      }
+    }
+    entry.close();
+  }
+}
+
+byte getFileCount() {
+  byte count = 0;
+  File root = SD.open("/");
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) {
+      root.close();
+      return count;
+    }
+    if (!entry.isDirectory()) {
+      count++;
+    }
+    entry.close();
+  }
+}
+
+// Function to handle pause/resume display
+void updatePauseDisplay(String filename, int progress) {
+  // Ensure progress is within valid range
+  progress = constrain(progress, 0, 100);
+  
+  lcd.clear();
+  if (filePaused) {
+    lcd.setCursor(0, 0); lcd.print(F("PAUSED "));
+    lcd.print(progress); lcd.print(F("%"));
+    lcd.setCursor(0, 1); lcd.print(F("Press to Resume"));
+  } else {
+    lcd.setCursor(0, 0); lcd.print(F("Running "));
+    lcd.print(progress); lcd.print(F("%"));
+    if (filename.length() > 0) {
+      lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+    } else {
+      lcd.setCursor(0, 1); lcd.print(F("Processing..."));
+    }
+  }
+}
+
+// Function to check for pause button press during file execution
+bool checkPauseButton() {
+  static unsigned long lastPauseCheck = 0;
+  static bool lastButtonState = false;
+  
+  if (millis() - lastPauseCheck > 50) { // Check every 50ms
+    bool currentButtonState = digitalRead(selectPin);
+    
+    // Detect rising edge (button press)
+    if (currentButtonState == HIGH && lastButtonState == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(selectPin) == HIGH) { // Confirm button is still pressed
+        while (digitalRead(selectPin) == HIGH) {} // Wait for release
+        filePaused = !filePaused; // Toggle pause state
+        
+        if (filePaused) {
+          // Send feed hold command to GRBL
+          Serial.print("!");
+          Serial.flush();
+        } else {
+          // Send cycle start/resume command to GRBL
+          Serial.print("~");
+          Serial.flush();
+        }
+        lastButtonState = false; // Reset state
+        lastPauseCheck = millis();
+        return true; // Pause state changed
+      }
+    }
+    lastButtonState = currentButtonState;
+    lastPauseCheck = millis();
+  }
+  return false; // No change
+}
+
+void sendFile(String filename) {
+  File dataFile = SD.open(filename);
+  if (!dataFile) {
+    lcd.clear(); lcd.setCursor(0, 0);
+    lcd.print(F("File Error!"));
+    delay(2000); return;
+  }
+  
+  fileRunning = true;
+  filePaused = false;  // Reset pause state
+  
+  // Show initial display
+  lcd.clear(); 
+  lcd.setCursor(0, 0); lcd.print(F("Counting..."));
+  lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+
+  // Count total lines first
+  numLineTotal = 0;
+  String line;
+  while (dataFile.available()) {
+    line = dataFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0 && !line.startsWith(";") && !line.startsWith("(")) {
+      numLineTotal++;
+    }
+  }
+  dataFile.close(); 
+  
+  // Reopen file for execution
+  dataFile = SD.open(filename);
+  if (!dataFile) {
+    lcd.clear(); lcd.setCursor(0, 0);
+    lcd.print(F("File Error!"));
+    delay(2000); 
+    fileRunning = false;
+    showMainMenu();
+    return;
+  }
+  
+  // Initialize for execution
+  sendCodeLine("G90"); sendCodeLine("G21");
+  numLineAct = 0;  // Reset line counter
+  
+  // Show initial progress
+  updatePauseDisplay(filename, 0);
+  
+  while (dataFile.available() && fileRunning) {
+    // Check for pause button press
+    if (checkPauseButton()) {
+      int progress = (numLineTotal > 0) ? (numLineAct * 100) / numLineTotal : 0;
+      updatePauseDisplay(filename, progress);
+    }
+    
+    // Only process lines when not paused
+    if (!filePaused && !awaitingOK) {
+      String line = dataFile.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0 && !line.startsWith(";") && !line.startsWith("(")) {
+        sendCodeLine(line);
+        numLineAct++;
+        
+        // Calculate and display progress (avoid division by zero)
+        int progress = (numLineTotal > 0) ? (numLineAct * 100) / numLineTotal : 0;
+        if (!filePaused) {
+          updatePauseDisplay(filename, progress);
+        }
+      }
+    } else if (!filePaused) {
+      // Still check for OK responses when not paused but waiting
+      checkForOK();
+    }
+    
+    // Handle paused state - still need to check for resume
+    if (filePaused) {
+      delay(50); // Longer delay when paused to save CPU
+    } else {
+      delay(10); // Small delay to prevent overwhelming the system
+    }
+  }
+  
+  if (fileRunning) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(F("Finishing..."));
+    lcd.setCursor(0, 1); lcd.print(F("Please wait"));
+    
+    // Wait for GRBL to finish all commands
+    // Send a status query and wait for idle state
+    unsigned long finishTimeout = millis();
+    bool isIdle = false;
+    
+    while (!isIdle && (millis() - finishTimeout < 60000)) { // 60 second timeout
+      Serial.println("?"); // Status query
+      delay(500); // Wait for response
+      
+      // Check for idle status
+      unsigned long responseTimeout = millis();
+      String response = "";
+      while (millis() - responseTimeout < 1000) { // 1 second timeout for response
+        if (Serial.available()) {
+          response = Serial.readString();
+          if (response.indexOf("Idle") >= 0) {
+            isIdle = true;
+            break;
+          }
+          if (response.indexOf("Run") >= 0 || response.indexOf("Hold") >= 0) {
+            break; // Still running, continue waiting
+          }
+        }
+        delay(10);
+      }
+      
+      // Allow pause checking even while waiting for completion
+      if (checkPauseButton()) {
+        updatePauseDisplay(filename, 100);
+      }
+    }
+    
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(F("Completed 100%"));
+    lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+    delay(3000);
+  }
+  
+  dataFile.close();
+  fileRunning = false;
+  filePaused = false;
+  showMainMenu();
+}
+
+void sendCodeLine(String code) {
+  // Skip empty commands
+  if (code.length() == 0) return;
+  
+  Serial.println(code);
+  Serial.flush(); // Ensure command is sent immediately
+  awaitingOK = true;
+  unsigned long timeout = millis();
+  
+  while (awaitingOK && (millis() - timeout < 10000)) {
+    checkForOK(); 
+    
+    // Allow pause checking even while waiting for OK
+    if (fileRunning) {
+      if (checkPauseButton()) {
+        int progress = (numLineTotal > 0) ? (numLineAct * 100) / numLineTotal : 0;
+        updatePauseDisplay("", progress);
+      }
+    }
+    delay(10);
+  }
+  
+  // Handle timeout - this makes it more robust
+  if (awaitingOK) {
+    awaitingOK = false; // Reset flag on timeout
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(F("Timeout Error!"));
+    lcd.setCursor(0, 1); lcd.print(code.substring(0, 16));
+    delay(2000);
+  }
+}
+
+void checkForOK() {
+  while (Serial.available()) {
+    String response = Serial.readStringUntil('\n');
+    response.trim(); // Remove whitespace
+    if (response.indexOf("ok") >= 0) {
+      awaitingOK = false;
+    }
+    // Also handle error responses
+    if (response.indexOf("error") >= 0) {
+      awaitingOK = false;
+      // Could add error handling here if needed
+    }
+    delay(1);
+  }
+}
+
+void showJogMenu() {
+  currentMenu = 2;  // Set the menu to Jog menu
+  selectedOption = 0;
+  lcd.clear();
+  updateJogMenu();
+}
+
+void updateJogMenu() {
+  lcd.clear();
+  const char* options[] = {"X+", "X-", "Y+", "Y-", "Z+", "Z-", "Back"};
+
+  for (byte i = 0; i < 3; i++) {
+    lcd.setCursor(0, i);
+    // Display '>' for the selected option
+    lcd.print((selectedOption + i < 7 && selectedOption == i + selectedOption) ? ">" : " ");
+    if (selectedOption + i < 7)
+      lcd.print(options[selectedOption + i]);  // Print option
+  }
+}
+
+void jog(String axis, float distance) {
+  sendCodeLine("G91");
+  String move = "G1 " + axis + String(distance, 2) + " F500";
+  sendCodeLine(move);
+  sendCodeLine("G90");
+}
+
+// This function handles the Jog menu and ensures proper transitions
+void handleJogMenu() {
+  if (digitalRead(upPin) == HIGH) {
+    if (selectedOption > 0) selectedOption--;
+    updateJogMenu();
+    while (digitalRead(upPin) == HIGH) {}
+  }
+  if (digitalRead(downPin) == HIGH) {
+    if (selectedOption < 6) selectedOption++;
+    updateJogMenu();
+    while (digitalRead(downPin) == HIGH) {}
+  }
+  if (digitalRead(selectPin) == HIGH) {
+    while (digitalRead(selectPin) == HIGH) {}
+    switch (selectedOption) {
+      case 0: jog("X", JOG_STEP_MM); break;
+      case 1: jog("X", -JOG_STEP_MM); break;
+      case 2: jog("Y", JOG_STEP_MM); break;
+      case 3: jog("Y", -JOG_STEP_MM); break;
+      case 4: jog("Z", JOG_STEP_MM); break;  
+      case 5: jog("Z", -JOG_STEP_MM); break; 
+      case 6: // Back option
+        currentMenu = 0; // Reset to Main menu
+        selectedOption = 4; // Reset to the Jog option position in main menu
+        showMainMenu(); // Show Main menu
+        updateMainMenu(); // Ensure the display is updated
+        return;
+    }
+    delay(500);
+    updateJogMenu();
+  }
+}
+
+void loop() {
+  static unsigned long lastButtonTime = 0;
+  #define DEBOUNCE_DELAY 50  // 50ms debounce delay
+
+  // Handle file running state - pause/resume functionality
+  if (fileRunning) {
+    // The pause/resume logic is handled within sendFile() and sendCodeLine()
+    // This ensures the file execution continues properly
+    return;
+  }
+
+  // Handle Jog menu separately when it's the active menu
+  if (currentMenu == 2) {
+    handleJogMenu();
+    return;
+  }
+
+  // Only handle menu navigation if we are not in the jog menu or running a file
+  if (millis() - lastButtonTime > 200) {
+    // UP Button
+    if (digitalRead(upPin) == HIGH) {
+      delay(DEBOUNCE_DELAY);              // Debounce delay
+      if (digitalRead(upPin) == HIGH) {   // Confirm button is still pressed
+        lastButtonTime = millis();
+        
+        if (currentMenu == 0 && selectedOption > 0) {
+          selectedOption--;
+          updateMainMenu();
+        } 
+        else if (currentMenu == 1 && selectedOption > 0) {
+          selectedOption--;
+          updateFileMenu();
+        }
+        
+        while (digitalRead(upPin) == HIGH) {} // Wait for button release
+      }
+    }
+
+    // DOWN Button
+    if (digitalRead(downPin) == HIGH) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(downPin) == HIGH) {
+        lastButtonTime = millis();
+        
+        if (currentMenu == 0 && selectedOption < 4) {
+          selectedOption++;
+          updateMainMenu();
+        } 
+        else if (currentMenu == 1) {
+          byte maxFiles = getFileCount();
+          if (selectedOption < maxFiles) {
+            selectedOption++;
+            updateFileMenu();
+          }
+        }
+        
+        while (digitalRead(downPin) == HIGH) {}
+      }
+    }
+
+    // SELECT Button
+    if (digitalRead(selectPin) == HIGH) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(selectPin) == HIGH) {
+        lastButtonTime = millis();
+        
+        if (currentMenu == 0) {
+          switch (selectedOption) {
+            case 0: 
+              lcd.clear(); lcd.print(F("Unlocking..."));
+              sendCodeLine("$X"); 
+              delay(1500); 
+              showMainMenu(); 
+              break;
+            case 1: 
+              lcd.clear(); lcd.print(F("ZeroXY..."));
+              sendCodeLine("G10 P0 L20 X0 Y0"); 
+              delay(1500); 
+              showMainMenu(); 
+              break;
+            case 2: 
+              lcd.clear(); lcd.print(F("ZeroZ..."));
+              sendCodeLine("G10 P0 L20 Z0"); 
+              delay(1500); 
+              showMainMenu(); 
+              break;
+            case 3: 
+              showFileMenu(); 
+              break;
+            case 4: 
+              showJogMenu(); 
+              break;
+          }
+        } 
+        else if (currentMenu == 1) {
+          if (selectedOption == 0) {
+            showMainMenu();
+          } else {
+            String filename = getFileName(selectedOption);
+            if (filename != "" && filename.length() > 0) {
+              // Show confirmation briefly
+              lcd.clear(); 
+              lcd.setCursor(0, 0); lcd.print(F("Starting..."));
+              lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+              delay(1000);
+              sendFile(filename);
+            } else {
+              lcd.clear();
+              lcd.setCursor(0, 0); lcd.print(F("File not found!"));
+              delay(1500);
+              updateFileMenu();
+            }
+          }
+        }
+        
+        while (digitalRead(selectPin) == HIGH) {}
+      }
+    }
+  }
+}

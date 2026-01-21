@@ -1,0 +1,758 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+
+// Pin Definitions
+#define upPin       PA0
+#define downPin     PA1
+#define selectPin   PA2
+#define cancelPin   PA3
+#define SD_card_Reader PA4
+
+#define DEBOUNCE_DELAY 50
+
+// LCD Setup
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Global State Variables
+byte currentMenu = 0;
+byte selectedOption = 0;
+bool fileRunning = false;
+bool filePaused = false;
+
+// File Progress Variables
+bool awaitingOK = false;
+String currentRunningFile = "";
+int numLineTotal = 0;
+int numLineAct = 0;
+int numLineSent = 0;  // Lines sent to GRBL
+bool allLinesSent = false;  // All lines from file have been sent
+bool jobCompleted = false;  // Job execution completed
+bool isFileLine = false;    // Flag for file lines
+
+// Feed Override Variables
+unsigned long lastFeedOverrideTime = 0;
+bool showFeedOverrideMessage = false;
+String feedOverrideMsg = "";
+int currentFeedRate = 100;
+
+static bool mpgEnabled = true;
+
+// Step Sizes
+float selectedXYStep = 10.0; // Default X/Y step size (mm)
+float selectedZStep = 5.0;   // Default Z step size (mm)
+
+const char* mainMenuOptions[] = {
+  "Unlock", "ZeroXYZ", "ZeroX", "ZeroY", "ZeroZ", "Run Files", "Jog", "Steps"
+};
+
+const byte mainMenuOptionCount = 8;
+
+String lastDisplayLine0 = "";
+String lastDisplayLine1 = "";
+unsigned long lastDisplayUpdate = 0;
+#define DISPLAY_UPDATE_INTERVAL 500  // Update display every 500ms
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(upPin, INPUT_PULLUP);
+  pinMode(downPin, INPUT_PULLUP);
+  pinMode(selectPin, INPUT_PULLUP);
+  pinMode(cancelPin, INPUT_PULLUP);
+
+  Serial.begin(115200);
+
+  if (!SD.begin(SD_card_Reader)) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("No SD Card"));
+    while (1);
+  }
+
+  Serial.write(0x18); // Ctrl+X soft reset
+  Serial.flush();
+  delay(1500);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" Harinder CNC"));
+  delay(1500);
+
+  Serial.write(0x8B); // Enter MPG mode
+  delay(1500);
+
+  showMainMenu();
+}
+
+void sendCodeLine(String code) {
+  if (code.length() == 0) return;
+  Serial.println(code);
+  Serial.flush();
+  awaitingOK = true;
+  unsigned long timeout = millis();
+  while (awaitingOK && (millis() - timeout < 10000)) {
+    checkForOK();
+    if (fileRunning) {
+      checkFeedOverrideButtons();
+      if (checkCancelButton()) return;
+      if (checkPauseButton()) {
+        // int progress = calculateProgress();
+        updatePauseDisplay(currentRunningFile, 0);
+      }
+    }
+    delay(10);
+  }
+}
+
+void checkForOK() {
+  while (Serial.available()) {
+    String response = Serial.readStringUntil('\n');
+    response.trim();
+    
+    // Check for OK response
+    if (response.indexOf("ok") >= 0) {
+      awaitingOK = false;
+      // if (fileRunning && !allLinesSent && isFileLine) {
+      //   numLineAct++;  // Increment only when GRBL acknowledges the file line
+      // }
+    }
+    
+    // Check for error response
+    if (response.indexOf("error") >= 0) {
+      awaitingOK = false;
+      if (!fileRunning) {
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(F("GRBL Error!"));
+        lcd.setCursor(0, 1); lcd.print(response.substring(0, 16));
+        delay(2000);
+      }
+    }
+    
+    // Check for job completion - GRBL responds with "Pgm End" or "Program End"
+    if (response.indexOf("Pgm End") >= 0 || response.indexOf("Program End") >= 0) {
+      if (fileRunning) {
+        jobCompleted = true;
+        // numLineAct = numLineTotal;  // Set progress to 100%
+      }
+    }
+    
+    // Check for idle status after all lines sent
+    if (response.startsWith("<Idle")) {
+      if (fileRunning && allLinesSent) {
+        jobCompleted = true;
+        // numLineAct = numLineTotal;
+      }
+    }
+    
+    delay(1);
+  }
+}
+
+// int calculateProgress() {
+//   if (numLineTotal == 0) return 0;
+//   if (jobCompleted) return 100;
+//   int progress = (numLineAct * 100) / numLineTotal;
+//   return min(100, max(0, progress));  // Clamp between 0-100
+// }
+
+void updatePauseDisplay(String filename, int progress) {
+  // Only update display every 500ms to prevent flickering
+  if (millis() - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL) {
+    return;
+  }
+  lastDisplayUpdate = millis();
+  
+  String line0 = "";
+  String line1 = "";
+  
+  if (filePaused) {
+    line0 = "PAUSED          ";
+    line1 = "SEL:Res CAN:Stop";
+  } else {
+    if (showFeedOverrideMessage && (millis() - lastFeedOverrideTime < 1500)) {
+      line0 = feedOverrideMsg;
+      // Pad with spaces to clear previous content
+      while (line0.length() < 16) line0 += " ";
+    } else {
+      showFeedOverrideMessage = false;
+      line0 = "Running:        ";
+    }
+    line1 = filename.substring(0, 16);
+    // Pad filename with spaces
+    while (line1.length() < 16) line1 += " ";
+  }
+  
+  // Only update LCD if content has changed
+  if (line0 != lastDisplayLine0) {
+    lcd.setCursor(0, 0);
+    lcd.print(line0);
+    lastDisplayLine0 = line0;
+  }
+  
+  if (line1 != lastDisplayLine1) {
+    lcd.setCursor(0, 1);
+    lcd.print(line1);
+    lastDisplayLine1 = line1;
+  }
+}
+
+void showMainMenu() {
+  currentMenu = 0;
+  selectedOption = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F(">")); lcd.print(mainMenuOptions[0]);
+  lcd.setCursor(0, 1); lcd.print(F(" ")); lcd.print(mainMenuOptions[1]);
+}
+
+void updateMainMenu() {
+  lcd.clear();
+  byte startOption = selectedOption > 0 ? selectedOption - 1 : 0;
+  for (byte i = 0; i < 2; i++) {
+    lcd.setCursor(0, i);
+    byte currentOption = startOption + i;
+    if (currentOption < mainMenuOptionCount) {
+      lcd.print(currentOption == selectedOption ? ">" : " ");
+      lcd.print(F(""));
+      lcd.print(mainMenuOptions[currentOption]);
+    }
+  }
+}
+
+void showFileMenu() {
+  currentMenu = 1;
+  selectedOption = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F(">Back"));
+  String filename = getFileName(1);
+  if (filename != "") {
+    lcd.setCursor(0, 1); lcd.print(F(" "));
+    lcd.print(filename.substring(0, 14));
+  } else {
+    lcd.setCursor(0, 1); lcd.print(F(" No files"));
+  }
+}
+
+void updateFileMenu() {
+  lcd.clear();
+  byte totalFiles = getFileCount();
+
+  if (totalFiles == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(">Back"));
+    lcd.setCursor(0, 1); lcd.print(F(" No files"));
+    return;
+  }
+
+  if (selectedOption == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(">Back"));
+    String firstFile = getFileName(1);
+    if (firstFile != "") {
+      lcd.setCursor(0, 1); lcd.print(F(" "));
+      lcd.print(firstFile.substring(0, 14));
+    }
+  } else {
+    String currentFile = getFileName(selectedOption);
+    String nextFile = (selectedOption < totalFiles) ? getFileName(selectedOption + 1) : "";
+
+    if (currentFile != "") {
+      lcd.setCursor(0, 0);
+      lcd.print(F(">"));
+      lcd.print(currentFile.substring(0, 14));
+    }
+
+    if (nextFile != "") {
+      lcd.setCursor(0, 1);
+      lcd.print(F(" "));
+      lcd.print(nextFile.substring(0, 14));
+    }
+  }
+}
+
+String getFileName(byte index) {
+  byte count = 0;
+  File root = SD.open("/");
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) {
+      root.close();
+      return "";
+    }
+    if (!entry.isDirectory()) {
+      count++;
+      if (count == index) {
+        String result = entry.name();
+        entry.close(); 
+        root.close();
+        return result;
+      }
+    }
+    entry.close();
+  }
+}
+
+byte getFileCount() {
+  byte count = 0;
+  File root = SD.open("/");
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) {
+      root.close();
+      return count;
+    }
+    if (!entry.isDirectory()) {
+      count++;
+    }
+    entry.close();
+  }
+}
+
+bool checkCancelButton() {
+  static unsigned long lastCancelCheck = 0;
+  if (millis() - lastCancelCheck > 50) {
+    if (digitalRead(cancelPin) == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(cancelPin) == LOW) {
+        while (digitalRead(cancelPin) == LOW) {}
+        Serial.println("\x18"); // Send Ctrl+X to reset GRBL
+        fileRunning = false;
+        filePaused = false;
+        allLinesSent = false;
+        jobCompleted = false;
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(F("Job Cancelled"));
+        delay(2000);
+        showMainMenu();
+        return true;
+      }
+    }
+    lastCancelCheck = millis();
+  }
+  return false;
+}
+
+bool checkPauseButton() {
+  static unsigned long lastPauseCheck = 0;
+  if (millis() - lastPauseCheck > 50) {
+    if (digitalRead(selectPin) == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(selectPin) == LOW) {
+        while (digitalRead(selectPin) == LOW) {}
+        filePaused = !filePaused;
+        if (filePaused) {
+          Serial.println("!"); // Send Feed Hold
+        } else {
+          Serial.println("~"); // Send Resume
+        }
+        return true;
+      }
+    }
+    lastPauseCheck = millis();
+  }
+  return false;
+}
+
+void checkFeedOverrideButtons() {
+  if (!fileRunning || filePaused) return;
+
+  if (digitalRead(upPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(upPin) == LOW) {
+      while (digitalRead(upPin) == LOW) {}
+      Serial.println("\x91"); // GRBL command for Feed Override +10%
+      if (currentFeedRate < 200) {
+          currentFeedRate += 10;
+      }
+      feedOverrideMsg = "Feed " + String(currentFeedRate) + "%";
+      showFeedOverrideMessage = true;
+      lastFeedOverrideTime = millis();
+    }
+  }
+
+  if (digitalRead(downPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(downPin) == LOW) {
+      while (digitalRead(downPin) == LOW) {}
+      Serial.println("\x92"); // GRBL command for Feed Override -10%
+      if (currentFeedRate > 10) {
+          currentFeedRate -= 10;
+      }
+      feedOverrideMsg = "Feed " + String(currentFeedRate) + "%";
+      showFeedOverrideMessage = true;
+      lastFeedOverrideTime = millis();
+    }
+  }
+}
+
+// Modified sendFile function - remove display update from main loop
+void sendFile(String filename) {
+  File dataFile = SD.open(filename);
+  if (!dataFile) {
+    lcd.clear(); 
+    lcd.setCursor(0, 0);
+    lcd.print(F("File Error!"));
+    delay(2000); 
+    return;
+  }
+
+  Serial.write(0x90); // Feed Override Reset (100%)
+  delay(100);
+
+
+  // Initialize file execution variables
+  fileRunning = true;
+  filePaused = false;
+  allLinesSent = false;
+  jobCompleted = false;
+  currentFeedRate = 100;
+  currentRunningFile = filename;
+  numLineAct = 0;
+  numLineSent = 0;
+  
+  // Initial display - clear tracking variables
+  lastDisplayLine0 = "";
+  lastDisplayLine1 = "";
+  lcd.clear(); 
+  lcd.setCursor(0, 0); lcd.print(F("Running:"));
+  lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+  delay(500);  // Show initial message briefly
+
+  numLineTotal = 0;
+  dataFile.close(); 
+  dataFile = SD.open(filename);
+
+  // Send initial setup commands
+  isFileLine = false;
+  sendCodeLine("G90"); 
+  sendCodeLine("G21");
+
+  // Send file line by line
+  while (fileRunning && !jobCompleted) {
+    checkFeedOverrideButtons();
+
+    if (checkCancelButton()) {
+      dataFile.close();
+      return;
+    }
+    
+    if (checkPauseButton()) {
+      updatePauseDisplay(filename, 0);
+    }
+
+    if (!filePaused && !awaitingOK && !allLinesSent) {
+      if (dataFile.available()) {
+        String line = dataFile.readStringUntil('\n');
+        line.trim();
+        if (line.length() > 0 && !line.startsWith(";") && !line.startsWith("(")) {
+          isFileLine = true;
+          sendCodeLine(line); 
+          isFileLine = false;
+          numLineSent++;          
+        }
+      } else {
+        dataFile.close();
+        allLinesSent = true;
+      }
+    } else if (!filePaused) {
+      checkForOK();
+    }
+
+    if (allLinesSent && !jobCompleted) {
+      static unsigned long lastStatusPoll = 0;
+      if (millis() - lastStatusPoll > 500) {
+        Serial.println("?");
+        lastStatusPoll = millis();
+      }
+    }
+
+    // Update display periodically (controlled by updatePauseDisplay)
+    updatePauseDisplay(filename, 0);
+    
+    delay(1);
+  }
+
+  // Job completed
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F("Completed 100%"));
+  lcd.setCursor(0, 1); lcd.print(filename.substring(0, 16));
+  delay(3000);
+
+  // Cleanup
+  if (dataFile) dataFile.close();
+  fileRunning = false;
+  filePaused = false;
+  allLinesSent = false;
+  jobCompleted = false;
+  numLineTotal = 0;
+  numLineAct = 0;
+  numLineSent = 0;
+  currentRunningFile = "";
+  showMainMenu();
+}
+
+void jog(String axis, float distance, int feed) {
+  Serial.println("$J=G91 " + axis + String(distance, 2) + " F" + String(feed));
+}
+
+void showJogMenu() {
+  currentMenu = 2;
+  selectedOption = 0;
+  lcd.clear();
+  updateJogMenu();
+}
+
+void updateJogMenu() {
+  lcd.clear();
+  const char* options[] = {
+    "Back", "X+", "X-", "Y+", "Y-", "Z+", "Z-",  
+    "GoZero", "E/D MPG"
+  };
+  const byte optionCount = 9;
+
+  byte startOption = selectedOption;
+  if (startOption > 0) startOption--;
+
+  for (byte i = 0; i < 2; i++) {
+    lcd.setCursor(0, i);
+    byte currentOptionIndex = startOption + i;
+    if (currentOptionIndex < optionCount) {
+      lcd.print((currentOptionIndex == selectedOption) ? ">" : " ");
+      lcd.print(options[currentOptionIndex]);
+      if (currentOptionIndex >= 1 && currentOptionIndex <= 6) {
+        lcd.setCursor(8, i);
+        lcd.print(currentOptionIndex <= 4 ? String(selectedXYStep, 1) + "mm" : String(selectedZStep, 1) + "mm");
+      }
+    }
+  }
+}
+
+void showStepsMenu() {
+  currentMenu = 3;
+  selectedOption = 0;
+  lcd.clear();
+  updateStepsMenu();
+}
+
+void updateStepsMenu() {
+  lcd.clear();
+  const char* options[] = {
+    "Back", "X/Y 10mm", "X/Y 50mm", "Z 0.1mm", "Z 1mm", "Z 5mm"
+  };
+  const byte optionCount = 6;
+
+  byte startOption = selectedOption;
+  if (startOption > 0) startOption--;
+
+  for (byte i = 0; i < 2; i++) {
+    lcd.setCursor(0, i);
+    byte currentOptionIndex = startOption + i;
+    if (currentOptionIndex < optionCount) {
+      lcd.print((currentOptionIndex == selectedOption) ? ">" : " ");
+      lcd.print(options[currentOptionIndex]);
+    }
+  }
+}
+
+void handleStepsMenu() {
+  if (digitalRead(upPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(upPin) == LOW) {
+      if (selectedOption > 0) selectedOption--;
+      updateStepsMenu();
+      while (digitalRead(upPin) == LOW) {}
+    }
+  }
+  if (digitalRead(downPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(downPin) == LOW) {
+      if (selectedOption < 5) selectedOption++;
+      updateStepsMenu();
+      while (digitalRead(downPin) == LOW) {}
+    }
+  }
+  if (digitalRead(selectPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(selectPin) == LOW) {
+      while (digitalRead(selectPin) == LOW) {}
+      switch (selectedOption) {
+        case 0: // Back
+          showMainMenu();
+          return;
+        case 1: // X/Y 10mm
+          selectedXYStep = 10.0;
+          lcd.clear(); lcd.print(F("X/Y Step: 10mm"));
+          delay(1000);
+          break;
+        case 2: // X/Y 50mm
+          selectedXYStep = 50.0;
+          lcd.clear(); lcd.print(F("X/Y Step: 50mm"));
+          delay(1000);
+          break;
+        case 3: // Z 0.1mm
+          selectedZStep = 0.1;
+          lcd.clear(); lcd.print(F("Z Step: 0.1mm"));
+          delay(1000);
+          break;
+        case 4: // Z 1mm
+          selectedZStep = 1.0;
+          lcd.clear(); lcd.print(F("Z Step: 1mm"));
+          delay(1000);
+          break;
+        case 5: // Z 5mm
+          selectedZStep = 5.0;
+          lcd.clear(); lcd.print(F("Z Step: 5mm"));
+          delay(1000);
+          break;
+      }
+      updateStepsMenu();
+    }
+  }
+}
+
+void handleJogMenu() {
+  if (digitalRead(upPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(upPin) == LOW) {
+      if (selectedOption > 0) selectedOption--;
+      updateJogMenu();
+      while (digitalRead(upPin) == LOW) {}
+    }
+  }
+  if (digitalRead(downPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(downPin) == LOW) {
+      if (selectedOption < 8) selectedOption++;
+      updateJogMenu();
+      while (digitalRead(downPin) == LOW) {}
+    }
+  }
+  if (digitalRead(selectPin) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(selectPin) == LOW) {
+      while (digitalRead(selectPin) == LOW) {}
+      switch (selectedOption) {
+        case 0: // Back
+          showMainMenu();
+          return;
+        case 1: jog("X", selectedXYStep, 3000); break;
+        case 2: jog("X", -selectedXYStep, 3000); break;
+        case 3: jog("Y", selectedXYStep, 3000); break;
+        case 4: jog("Y", -selectedXYStep, 3000); break;
+        case 5: jog("Z", selectedZStep, 300); break;
+        case 6: jog("Z", -selectedZStep, 300); break;
+        case 7: // Go to Zero
+          lcd.clear(); lcd.print("Go to Zero...");
+          Serial.println("G90");
+          Serial.println("G0 X0 Y0 Z0"); 
+          delay(1500);
+          break;
+        case 8: // E/D MPG toggle
+          mpgEnabled = !mpgEnabled;
+          lcd.clear();
+          if (mpgEnabled) {
+            lcd.print("MPG Enabled");
+            Serial.write(0x8B);
+          } else {
+            lcd.print("MPG Disabled");
+            Serial.write(0x8B);
+          }
+          delay(1000);
+          break;
+      }
+      delay(200);
+      updateJogMenu();
+    }
+  }
+}
+
+void loop() {
+  static unsigned long lastButtonTime = 0;
+
+  if (currentMenu == 2) {
+    handleJogMenu();
+    return;
+  }
+
+  if (currentMenu == 3) {
+    handleStepsMenu();
+    return;
+  }
+
+  if (millis() - lastButtonTime > 200) {
+    if (digitalRead(upPin) == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(upPin) == LOW) {
+        lastButtonTime = millis();
+        if (currentMenu == 0 && selectedOption > 0) {
+          selectedOption--;
+          updateMainMenu();
+        } else if (currentMenu == 1 && selectedOption > 0) {
+          selectedOption--;
+          updateFileMenu();
+        }
+        while (digitalRead(upPin) == LOW) {}
+      }
+    }
+
+    if (digitalRead(downPin) == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(downPin) == LOW) {
+        lastButtonTime = millis();
+        if (currentMenu == 0 && selectedOption < 7) {
+          selectedOption++;
+          updateMainMenu();
+        } else if (currentMenu == 1) {
+          byte maxFiles = getFileCount();
+          if (selectedOption < maxFiles) {
+            selectedOption++;
+            updateFileMenu();
+          }
+        }
+        while (digitalRead(downPin) == LOW) {}
+      }
+    }
+
+    if (digitalRead(selectPin) == LOW) {
+      delay(DEBOUNCE_DELAY);
+      if (digitalRead(selectPin) == LOW) {
+        lastButtonTime = millis();
+        if (currentMenu == 0) {
+          switch (selectedOption) {
+            case 0:
+              lcd.clear(); lcd.print(F("Unlocking..."));
+              Serial.println("$X"); delay(1500); showMainMenu(); break;
+            case 1:
+              lcd.clear(); lcd.print(F("ZeroXYZ..."));
+              Serial.println("G10 P0 L20 X0 Y0 Z0"); delay(1500); showMainMenu(); break;
+            case 2:
+              lcd.clear(); lcd.print(F("ZeroX..."));
+              Serial.println("G10 P0 L20 X0"); delay(1500); showMainMenu(); break;
+            case 3:
+              lcd.clear(); lcd.print(F("ZeroY..."));
+              Serial.println("G10 P0 L20 Y0"); delay(1500); showMainMenu(); break;
+            case 4:
+              lcd.clear(); lcd.print(F("ZeroZ..."));
+              Serial.println("G10 P0 L20 Z0"); delay(1500); showMainMenu(); break;
+            case 5:
+              showFileMenu(); break;
+            case 6:
+              showJogMenu(); break;
+            case 7:
+              showStepsMenu(); break;
+          }
+        } else if (currentMenu == 1) {
+          if (selectedOption == 0) {
+            showMainMenu();
+          } else {
+            String filename = getFileName(selectedOption);
+            if (filename != "") {
+              sendFile(filename);
+            }
+          }
+        }
+        while (digitalRead(selectPin) == LOW) {}
+      }
+    }
+  }
+}

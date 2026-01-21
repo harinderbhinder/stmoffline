@@ -1,0 +1,142 @@
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+
+// Pin Definitions
+#define xPlusPin    PA0    // X+ button
+#define xMinusPin   PA1    // X- button
+#define unlockPin   PA2    // Unlock button
+#define statusPin   PA3    // Request status
+
+#define DEBOUNCE_DELAY 200
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Debug variables
+String lastResponse = "";
+String currentStatus = "INIT";
+
+unsigned long lastButtonTime = 0;
+
+void setup() {
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(xPlusPin, INPUT_PULLUP);
+  pinMode(xMinusPin, INPUT_PULLUP);
+  pinMode(unlockPin, INPUT_PULLUP);
+  pinMode(statusPin, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  Serial.setTimeout(100);
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F("grblHAL Offline"));
+  lcd.setCursor(0, 1); lcd.print(F("Booting..."));
+  delay(2000);
+
+
+  lcd.setCursor(0, 1); lcd.print("Resetting...");
+  Serial.write(0x18); // Ctrl+X soft reset
+  Serial.flush();
+  delay(2000);        // give grblHAL time to restart
+
+  Serial.write(0x8B); // Enter MPG mode
+  delay(2000);
+
+  // Serial.write(0x8C); // real time reporting
+  // delay(2000);
+
+  initializeGRBL();
+}
+
+void initializeGRBL() {
+  unsigned long start = millis();
+  lastResponse = "";
+  while (millis() - start < 5000) {   // wait up to 5s
+    if (Serial.available()) {
+      String resp = Serial.readStringUntil('\n');
+      resp.trim();
+      if (resp.length()) {
+        lastResponse = resp;
+        currentStatus = "READY";
+        break;
+      }
+    }
+  }
+
+  if (lastResponse == "") {
+    lastResponse = "No Resp";
+    currentStatus = "ERROR";
+  }
+
+  updateDisplay();
+}
+void updateDisplay() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(currentStatus);
+  lcd.setCursor(0, 1);
+  lcd.print(lastResponse.substring(0, 16));
+}
+
+void checkSerialResponse() {
+  while (Serial.available()) {
+    String response = Serial.readStringUntil('\n');
+    response.trim();
+
+    if (response == "ok") {
+      lastResponse = "OK";
+      currentStatus = "IDLE";
+    } else if (response.startsWith("error")) {
+      lastResponse = response;
+      currentStatus = "ERROR";
+    } else if (response.startsWith("ALARM")) {
+      lastResponse = response;
+      currentStatus = "ALARM";
+    } else if (response.length()) {
+      lastResponse = response;
+    }
+    updateDisplay();
+  }
+}
+
+void loop() {
+  checkSerialResponse();
+
+  // debounce
+  if (millis() - lastButtonTime < DEBOUNCE_DELAY) return;
+
+  if (digitalRead(unlockPin) == LOW) {
+    Serial.println("$X");
+    lastResponse = "Send $X";
+    currentStatus = "UNLOCK";
+    updateDisplay();
+    lastButtonTime = millis();
+  }
+  if (digitalRead(xPlusPin) == LOW) {
+    Serial.println("G91");
+    Serial.println("G0 X1");
+    Serial.println("G90");
+    lastResponse = "Send X+";
+    currentStatus = "MOVE";
+    updateDisplay();
+    lastButtonTime = millis();
+  }
+  if (digitalRead(xMinusPin) == LOW) {
+    Serial.println("G91");
+    Serial.println("G0 X-1");
+    Serial.println("G90");
+    lastResponse = "Send X-";
+    currentStatus = "MOVE";
+    updateDisplay();
+    lastButtonTime = millis();
+  }
+  if (digitalRead(statusPin) == LOW) {
+    Serial.write('?');  // request status report
+    lastResponse = "Req Status";
+    currentStatus = "STATUS";
+    updateDisplay();
+    lastButtonTime = millis();
+  }
+}
